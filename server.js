@@ -2,7 +2,19 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 
-const app = express();
+const express = require('express');
+const cors = require('cors');
+
+const app = express();  // ← واحد بس!
+
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  credentials: true
+}));
+
+app.use(express.json());
+// ... باقي الكود
 const PORT = process.env.PORT || 3001;
 
 app.use(express.json());
