@@ -55,10 +55,18 @@ function getRequiredSupabaseConfig() {
 function getResendClient() {
     const resendApiKey = String(process.env.RESEND_API_KEY || '').trim();
     if (!resendApiKey) {
-        throw new Error('Invoice email service is not configured. Missing RESEND_API_KEY on the server.');
+        throw new Error('Missing RESEND_API_KEY on the server.');
     }
 
     return new Resend(resendApiKey);
+}
+
+function getReplyToAddress() {
+    return String(process.env.SEND_REPLY_TO || process.env.SMTP_FROM || 'info@gamerscash.com').trim();
+}
+
+function getSendFromAddress() {
+    return String(process.env.SEND_FROM || 'Gamers Cash <info@gamerscash.com>').trim();
 }
 
 function getBearerToken(req) {
@@ -150,6 +158,74 @@ async function deleteAuthUser(userId) {
             'apikey': SUPABASE_SERVICE_ROLE_KEY,
             'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
         }
+    });
+}
+
+async function generatePasswordRecoveryLink(email, redirectTo) {
+    getRequiredSupabaseConfig();
+
+    const payload = await fetchSupabaseJson(`${SUPABASE_URL}/auth/v1/admin/generate_link`, {
+        method: 'POST',
+        headers: {
+            'apikey': SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            type: 'recovery',
+            email,
+            redirect_to: redirectTo,
+            redirectTo
+        })
+    });
+
+    const actionLink = payload?.action_link
+        || payload?.actionLink
+        || payload?.properties?.action_link
+        || payload?.properties?.actionLink
+        || payload?.data?.action_link
+        || payload?.data?.actionLink
+        || '';
+
+    if (!actionLink) {
+        throw new Error('Supabase did not return a password recovery link.');
+    }
+
+    return {
+        actionLink,
+        payload
+    };
+}
+
+async function sendPasswordRecoveryEmail(email, actionLink) {
+    const resend = getResendClient();
+
+    return resend.emails.send({
+        from: getSendFromAddress(),
+        to: email,
+        subject: 'Reset your Gamers Cash password',
+        replyTo: getReplyToAddress(),
+        html: `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #111827;">
+                <h2 style="margin-bottom: 16px; color: #111827;">Reset your password</h2>
+                <p style="line-height: 1.6; color: #374151;">We received a request to reset the password for your Gamers Cash account.</p>
+                <p style="line-height: 1.6; color: #374151;">Click the button below to choose a new password:</p>
+                <p style="margin: 28px 0;">
+                    <a href="${actionLink}" style="display: inline-block; background: #8aa2ff; color: #0b0b0b; text-decoration: none; font-weight: 700; padding: 12px 20px; border-radius: 10px;">Reset Password</a>
+                </p>
+                <p style="line-height: 1.6; color: #374151;">If the button does not work, copy and paste this link into your browser:</p>
+                <p style="word-break: break-all; color: #4b5563;">${actionLink}</p>
+                <p style="line-height: 1.6; color: #6b7280;">If you did not request this, you can safely ignore this email.</p>
+            </div>
+        `,
+        text: [
+            'Reset your Gamers Cash password',
+            '',
+            'Open this link to choose a new password:',
+            actionLink,
+            '',
+            'If you did not request this, you can ignore this email.'
+        ].join('\n')
     });
 }
 
@@ -412,6 +488,50 @@ app.post(['/send-invoice', '/api/send-invoice'], async (req, res) => {
         console.error('[Invoice] Error:', error);
         res.status(500).json({ 
             error: error.message || 'Failed to send invoice' 
+        });
+    }
+});
+
+app.post(['/send-password-reset', '/api/send-password-reset'], async (req, res) => {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const redirectTo = String(req.body?.redirectTo || '').trim();
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({
+            error: 'Missing or invalid email address.'
+        });
+    }
+
+    if (!redirectTo) {
+        return res.status(400).json({
+            error: 'Missing redirectTo URL.'
+        });
+    }
+
+    try {
+        const { actionLink } = await generatePasswordRecoveryLink(email, redirectTo);
+        await sendPasswordRecoveryEmail(email, actionLink);
+
+        return res.status(200).json({
+            success: true,
+            message: 'Password reset email sent.'
+        });
+    } catch (error) {
+        const normalizedMessage = String(error?.message || '').toLowerCase();
+        const userNotFound = normalizedMessage.includes('user not found')
+            || normalizedMessage.includes('email not found')
+            || normalizedMessage.includes('for security purposes');
+
+        if (userNotFound) {
+            return res.status(200).json({
+                success: true,
+                message: 'Password reset email sent.'
+            });
+        }
+
+        console.error('[Password Reset] Error:', error);
+        return res.status(Number.isInteger(error?.status) ? error.status : 500).json({
+            error: error?.message || 'Failed to send password reset email.'
         });
     }
 });
