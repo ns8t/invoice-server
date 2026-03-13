@@ -10,14 +10,148 @@ const PDFDocument = require('pdfkit');
 const { Resend } = require('resend');
 
 const app = express();
-const resend = new Resend(process.env.RESEND_API_KEY);
+const SUPABASE_URL = String(process.env.SUPABASE_URL || '').trim();
+const SUPABASE_ANON_KEY = String(process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_ANON || '').trim();
+const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+const DEFAULT_ALLOWED_ORIGINS = [
+    'https://gamerscash.net',
+    'https://www.gamerscash.net',
+    'http://127.0.0.1:5500',
+    'http://localhost:5500'
+];
+const ALLOWED_ORIGINS = Array.from(
+    new Set(
+        [
+            ...DEFAULT_ALLOWED_ORIGINS,
+            ...String(process.env.ALLOWED_ORIGIN || '')
+                .split(',')
+                .map((origin) => origin.trim())
+                .filter(Boolean)
+        ]
+    )
+);
 
-app.use(cors({ 
-    origin: '*', 
+app.use(cors({
+    origin(origin, callback) {
+        if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+            callback(null, true);
+            return;
+        }
+
+        callback(new Error(`Origin ${origin} is not allowed by CORS`));
+    },
     methods: ['GET', 'POST', 'OPTIONS'],
-    credentials: true 
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true
 }));
 app.use(express.json());
+
+function getRequiredSupabaseConfig() {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+        throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY on the server.');
+    }
+}
+
+function getResendClient() {
+    const resendApiKey = String(process.env.RESEND_API_KEY || '').trim();
+    if (!resendApiKey) {
+        throw new Error('Invoice email service is not configured. Missing RESEND_API_KEY on the server.');
+    }
+
+    return new Resend(resendApiKey);
+}
+
+function getBearerToken(req) {
+    const authHeader = String(req.get('Authorization') || '').trim();
+    if (!authHeader.toLowerCase().startsWith('bearer ')) {
+        return '';
+    }
+
+    return authHeader.slice(7).trim();
+}
+
+async function readJsonResponse(response) {
+    const rawText = await response.text();
+    if (!rawText) {
+        return null;
+    }
+
+    try {
+        return JSON.parse(rawText);
+    } catch (error) {
+        return { rawText };
+    }
+}
+
+async function fetchSupabaseJson(url, options = {}) {
+    const response = await fetch(url, options);
+    const payload = await readJsonResponse(response);
+
+    if (!response.ok) {
+        const error = new Error(
+            payload?.msg
+            || payload?.message
+            || payload?.error_description
+            || payload?.error
+            || `Supabase request failed (${response.status})`
+        );
+        error.status = response.status;
+        error.payload = payload;
+        throw error;
+    }
+
+    return payload;
+}
+
+async function getUserFromAccessToken(accessToken) {
+    getRequiredSupabaseConfig();
+
+    return fetchSupabaseJson(`${SUPABASE_URL}/auth/v1/user`, {
+        method: 'GET',
+        headers: {
+            'apikey': SUPABASE_ANON_KEY || SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${accessToken}`
+        }
+    });
+}
+
+async function deletePublicRows(table, filters) {
+    getRequiredSupabaseConfig();
+
+    const url = new URL(`${SUPABASE_URL}/rest/v1/${table}`);
+    Object.entries(filters).forEach(([column, value]) => {
+        url.searchParams.set(column, `eq.${value}`);
+    });
+
+    const response = await fetch(url.toString(), {
+        method: 'DELETE',
+        headers: {
+            'apikey': SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+            'Prefer': 'return=minimal'
+        }
+    });
+
+    if (!response.ok) {
+        const payload = await readJsonResponse(response);
+        console.warn(
+            `[Delete Account] Failed to delete from ${table}:`,
+            payload?.message || payload?.error || response.statusText
+        );
+    }
+}
+
+async function deleteAuthUser(userId) {
+    getRequiredSupabaseConfig();
+
+    await fetchSupabaseJson(`${SUPABASE_URL}/auth/v1/admin/users/${userId}`, {
+        method: 'DELETE',
+        headers: {
+            'apikey': SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
+        }
+    });
+}
 
 // ========================================================
 // Generate Invoice PDF
@@ -188,7 +322,7 @@ function generateInvoicePDF(orderData) {
 // Send Invoice Email
 // ========================================================
 
-app.post('/send-invoice', async (req, res) => {
+app.post(['/send-invoice', '/api/send-invoice'], async (req, res) => {
     try {
         const { 
             ticket_id,
@@ -229,6 +363,8 @@ app.post('/send-invoice', async (req, res) => {
         });
 
         console.log(`[Invoice] PDF generated, size: ${pdfBuffer.length} bytes`);
+
+        const resend = getResendClient();
 
         // Send Email
         const result = await resend.emails.send({
@@ -281,11 +417,59 @@ app.post('/send-invoice', async (req, res) => {
 });
 
 // ========================================================
+// Delete Account
+// ========================================================
+
+app.post(['/delete-account', '/api/delete-account'], async (req, res) => {
+    try {
+        const accessToken = getBearerToken(req);
+        if (!accessToken) {
+            return res.status(401).json({ error: 'Missing bearer token.' });
+        }
+
+        const user = await getUserFromAccessToken(accessToken);
+        if (!user?.id) {
+            return res.status(401).json({ error: 'Authenticated user not found.' });
+        }
+
+        await Promise.allSettled([
+            deletePublicRows('profiles', { id: user.id }),
+            deletePublicRows('orders', { user_id: user.id }),
+            deletePublicRows('orders', { customer_id: user.id })
+        ]);
+
+        await deleteAuthUser(user.id);
+
+        return res.status(200).json({
+            success: true,
+            message: 'Account deleted successfully.',
+            userId: user.id
+        });
+    } catch (error) {
+        console.error('[Delete Account] Error:', error);
+
+        const status = Number.isInteger(error?.status) ? error.status : 500;
+        const message = status >= 500
+            ? 'Delete-account service is not ready. Check server env vars and deployment logs.'
+            : error.message;
+
+        return res.status(status).json({
+            error: message
+        });
+    }
+});
+
+// ========================================================
 // Health Check
 // ========================================================
 
-app.get('/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+app.get(['/health', '/api/health'], (req, res) => {
+    res.json({
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        emailConfigured: Boolean(String(process.env.RESEND_API_KEY || '').trim()),
+        deleteAccountConfigured: Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
+    });
 });
 
 // ========================================================
@@ -296,4 +480,7 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
     console.log(`[Invoice Server] Running on port ${PORT}`);
     console.log(`[Invoice Server] Resend API Key: ${process.env.RESEND_API_KEY ? '✓ Set' : '✗ Missing'}`);
+    console.log(`[Invoice Server] Supabase URL: ${SUPABASE_URL ? '✓ Set' : '✗ Missing'}`);
+    console.log(`[Invoice Server] Supabase Service Role: ${SUPABASE_SERVICE_ROLE_KEY ? '✓ Set' : '✗ Missing'}`);
+    console.log(`[Invoice Server] Allowed Origins: ${ALLOWED_ORIGINS.join(', ')}`);
 });
